@@ -80,15 +80,11 @@ class ExceptionDataParser(object):
 
         self.ctx = None
 
-        self.sp = None
-        self.end = None
-        self.offset = None
-
-        self.stack = {}
+        self.contexts = {}
 
     def _parse_backtrace(self, line):
         if line.startswith('Backtrace:'):
-            self.stack = {"backtrace": [StackLine(offset=0, content=(addr,)) for addr in BACKTRACE_REGEX.findall(line)]}
+            self.contexts = {"backtrace": [StackLine(offset=0, content=(addr,)) for addr in BACKTRACE_REGEX.findall(line)]}
             return None
         return self._parse_backtrace
 
@@ -114,16 +110,18 @@ class ExceptionDataParser(object):
         match = CTX_REGEX.match(line)
         if match is not None:
             self.ctx = match.group("ctx")
-            self.stack[self.ctx] = []
+            self.contexts.setdefault(self.ctx, {"stack":[], "pointers":{}})
             return self._parse_pointers
         return self._parse_ctx
 
     def _parse_pointers(self, line):
         match = POINTER_REGEX.match(line)
         if match is not None:
-            self.sp = match.group("sp")
-            self.end = match.group("end")
-            self.offset = match.group("offset")
+            self.contexts[self.ctx]["pointers"] = {
+                "sp": match.group("sp"),
+                "end": match.group("end"),
+                "offset": match.group("offset")
+            }
             return self._parse_stack_line
         return self._parse_pointers
 
@@ -136,11 +134,11 @@ class ExceptionDataParser(object):
         if line != STACK_END:
             match = STACK_REGEX.match(line)
             if match is not None:
-                self.stack[self.ctx].append(StackLine(offset=match.group("off"),
-                                            content=(match.group("c1"), match.group("c2"), match.group("c3"),
-                                                     match.group("c4"))))
-            elif self.ctx == "bearssl":
-                return self._parse_ctx
+                self.contexts[self.ctx]["stack"].append(StackLine(offset=match.group("off"),
+                                            content=(match.group("c1"), match.group("c2"), match.group("c3"), match.group("c4"))))
+            elif line and self._parse_ctx(line):
+                return self._parse_pointers
+
             return self._parse_stack_line
         return None
 
@@ -196,12 +194,14 @@ class AddressResolver(object):
             last = match.group("addr")
 
     def fill(self, parser):
-        addresses = [parser.epc1, parser.epc2, parser.epc3, parser.excvaddr, parser.sp, parser.end, parser.offset]
-        for ctx, stack in parser.stack.items():
-            for line in stack:
+        exception = [parser.epc1, parser.epc2, parser.epc3, parser.excvaddr]
+        for ctx, values in parser.contexts.items():
+            sp, end, offset = values["pointers"].values()
+            addresses = exception + [sp, end, offset]
+            for line in values["stack"]:
                 addresses.extend(line.content)
 
-        self._lookup(addresses)
+            self._lookup(addresses)
 
     def _sanitize_addr(self, addr):
         if addr.startswith("0x"):
@@ -233,23 +233,34 @@ def print_addr(name, value, resolver):
     print("{}:{} {}".format(name, " " * (8 - len(name)), resolver.resolve_addr(value)))
 
 
-def print_stack_full(stack, resolver):
+def print_stack_full(parser, resolver):
     print("stack:")
-    for ctx, lines in stack.items():
+    for ctx, values in parser.contexts.items():
         print("")
         print("ctx: " + ctx)
-        for line in lines:
+
+        print("")
+        sp, end, offset = values["pointers"].values()
+        print_addr("sp", sp, resolver)
+        print_addr("end", end, resolver)
+        print_addr("offset", offset, resolver)
+        for line in values["stack"]:
             print(line.offset + ":")
             for content in line.content:
                 print("  " + resolver.resolve_stack_addr(content))
 
 
-def print_stack(stack, resolver):
+def print_stack(parser, resolver):
     print("stack:")
-    for ctx, lines in stack.items():
+    for ctx, values in parser.contexts.items():
         print("")
         print("ctx: " + ctx)
-        for line in lines:
+        sp, end, offset = values["pointers"].values()
+        print_addr("sp", sp, resolver)
+        print_addr("end", end, resolver)
+        print_addr("offset", offset, resolver)
+        print("")
+        for line in values["stack"]:
             for content in line.content:
                 out = resolver.resolve_stack_addr(content, full=False)
                 if out is not None:
@@ -268,15 +279,10 @@ def print_result(parser, resolver, platform, full=True, stack_only=False):
         print_addr("depc", parser.depc, resolver)
 
         print("")
-        print_addr("sp", parser.sp, resolver)
-        print_addr("end", parser.end, resolver)
-        print_addr("offset", parser.offset, resolver)
-
-        print("")
     if full:
-        print_stack_full(parser.stack, resolver)
+        print_stack_full(parser, resolver)
     else:
-        print_stack(parser.stack, resolver)
+        print_stack(parser, resolver)
 
 
 def parse_args():
