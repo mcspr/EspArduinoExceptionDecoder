@@ -84,11 +84,11 @@ class ExceptionDataParser(object):
         self.end = None
         self.offset = None
 
-        self.stack = []
+        self.stack = {}
 
     def _parse_backtrace(self, line):
         if line.startswith('Backtrace:'):
-            self.stack = [StackLine(offset=0, content=(addr,)) for addr in BACKTRACE_REGEX.findall(line)]
+            self.stack = {"backtrace": [StackLine(offset=0, content=(addr,)) for addr in BACKTRACE_REGEX.findall(line)]}
             return None
         return self._parse_backtrace
 
@@ -107,13 +107,14 @@ class ExceptionDataParser(object):
             self.epc3 = match.group("epc3")
             self.excvaddr = match.group("excvaddr")
             self.depc = match.group("depc")
-            return self._parse_ctx
+            return self._parse_stack_begin
         return self._parse_counters
 
     def _parse_ctx(self, line):
         match = CTX_REGEX.match(line)
         if match is not None:
             self.ctx = match.group("ctx")
+            self.stack[self.ctx] = []
             return self._parse_pointers
         return self._parse_ctx
 
@@ -123,21 +124,23 @@ class ExceptionDataParser(object):
             self.sp = match.group("sp")
             self.end = match.group("end")
             self.offset = match.group("offset")
-            return self._parse_stack_begin
+            return self._parse_stack_line
         return self._parse_pointers
 
     def _parse_stack_begin(self, line):
         if line == STACK_BEGIN:
-            return self._parse_stack_line
+            return self._parse_ctx
         return self._parse_stack_begin
 
     def _parse_stack_line(self, line):
         if line != STACK_END:
             match = STACK_REGEX.match(line)
             if match is not None:
-                self.stack.append(StackLine(offset=match.group("off"),
+                self.stack[self.ctx].append(StackLine(offset=match.group("off"),
                                             content=(match.group("c1"), match.group("c2"), match.group("c3"),
                                                      match.group("c4"))))
+            elif self.ctx == "bearssl":
+                return self._parse_ctx
             return self._parse_stack_line
         return None
 
@@ -194,8 +197,9 @@ class AddressResolver(object):
 
     def fill(self, parser):
         addresses = [parser.epc1, parser.epc2, parser.epc3, parser.excvaddr, parser.sp, parser.end, parser.offset]
-        for line in parser.stack:
-            addresses.extend(line.content)
+        for ctx, stack in parser.stack.items():
+            for line in stack:
+                addresses.extend(line.content)
 
         self._lookup(addresses)
 
@@ -229,22 +233,27 @@ def print_addr(name, value, resolver):
     print("{}:{} {}".format(name, " " * (8 - len(name)), resolver.resolve_addr(value)))
 
 
-def print_stack_full(lines, resolver):
+def print_stack_full(stack, resolver):
     print("stack:")
-    for line in lines:
-        print(line.offset + ":")
-        for content in line.content:
-            print("  " + resolver.resolve_stack_addr(content))
+    for ctx, lines in stack.items():
+        print("")
+        print("ctx: " + ctx)
+        for line in lines:
+            print(line.offset + ":")
+            for content in line.content:
+                print("  " + resolver.resolve_stack_addr(content))
 
 
-def print_stack(lines, resolver):
+def print_stack(stack, resolver):
     print("stack:")
-    for line in lines:
-        for content in line.content:
-            out = resolver.resolve_stack_addr(content, full=False)
-            if out is None:
-                continue
-            print(out)
+    for ctx, lines in stack.items():
+        print("")
+        print("ctx: " + ctx)
+        for line in lines:
+            for content in line.content:
+                out = resolver.resolve_stack_addr(content, full=False)
+                if out is not None:
+                    print(out)
 
 
 def print_result(parser, resolver, platform, full=True, stack_only=False):
@@ -257,9 +266,6 @@ def print_result(parser, resolver, platform, full=True, stack_only=False):
         print_addr("epc3", parser.epc3, resolver)
         print_addr("excvaddr", parser.excvaddr, resolver)
         print_addr("depc", parser.depc, resolver)
-
-        print("")
-        print("ctx: " + parser.ctx)
 
         print("")
         print_addr("sp", parser.sp, resolver)
